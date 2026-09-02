@@ -43,4 +43,11 @@ public sealed class AppSettings
 
     /// <summary>Gets or sets the frontend base URL used in links (password resets).</summary>
     public string FrontendBaseUrl { get; init; } = "http://localhost:4200";
+
+    /// <summary>
+    /// Gets the browser origins allowed by CORS. SignalR (websockets) and the
+    /// Angular dev server are covered here; keep production origins in
+    /// configuration rather than hard-coding them.
+    /// </summary>
+    public string[] CorsOrigins { get; init; } = ["http://localhost:4200"];
 }

@@ -38,4 +38,8 @@ public sealed class JwtSettings
     /// </summary>
     [Range(1, 1440)]
     public int ExpiryMinutes { get; init; } = 120;
+
+    /// <summary>Gets the refresh-token lifetime in days (1–365).</summary>
+    [Range(1, 365)]
+    public int RefreshTokenExpirationDays { get; init; } = 7;
 }

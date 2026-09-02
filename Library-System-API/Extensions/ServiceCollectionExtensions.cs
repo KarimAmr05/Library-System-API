@@ -59,6 +59,16 @@ public static class ServiceCollectionExtensions
             .Bind(configuration.GetSection(AppSettings.SectionName))
             .ValidateOnStart();
 
+        // CORS for the browser clients (Angular dev server, gateway origins).
+        // Required for SignalR negotiate/websocket requests that carry Origin.
+        var appSettings = configuration.GetSection(AppSettings.SectionName).Get<AppSettings>()
+                          ?? new AppSettings();
+        services.AddCors(options => options.AddDefaultPolicy(policy => policy
+            .WithOrigins(appSettings.CorsOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials()));
+
         // Email delivery (best-effort; logs content when SMTP is unconfigured).
         services.AddSingleton<IEmailSender, SmtpEmailSender>();
 
@@ -110,6 +120,7 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IBookService, BookService>();
         services.AddScoped<IBorrowingService, BorrowingService>();
         services.AddScoped<INotificationService, NotificationService>();
+        services.AddScoped<IUserService, UserService>();
 
         // Messaging infrastructure (singleton connection shared by publisher/consumer)
         services.AddSingleton<RabbitMqConnection>();

@@ -72,11 +72,7 @@ public sealed class AuthService(
                 new Error(ErrorCodes.Forbidden, "This account has been deactivated."));
         }
 
-        var expiresAtUtc = DateTime.UtcNow.AddMinutes(_jwtSettings.ExpiryMinutes);
-        var token = _jwtService.GenerateToken(user.Id, user.Email, user.Role);
-
-        return Result.Success(new LoginResponseDto(token, expiresAtUtc, user.Id, user.Email,
-            user.Role.ToString()));
+        return Result.Success(await IssueTokenPairAsync(user, cancellationToken).ConfigureAwait(false));
     }
 
     /// <inheritdoc />
@@ -117,11 +113,7 @@ public sealed class AuthService(
         await _unitOfWork.Users.AddAsync(user, cancellationToken).ConfigureAwait(false);
         await _unitOfWork.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
-        var expiresAtUtc = DateTime.UtcNow.AddMinutes(_jwtSettings.ExpiryMinutes);
-        var token = _jwtService.GenerateToken(user.Id, user.Email, user.Role);
-
-        return Result.Success(new LoginResponseDto(token, expiresAtUtc, user.Id, user.Email,
-            user.Role.ToString()));
+        return Result.Success(await IssueTokenPairAsync(user, cancellationToken).ConfigureAwait(false));
     }
 
     /// <inheritdoc />
@@ -230,6 +222,10 @@ public sealed class AuthService(
         // The token came from an untracked read — mark it modified explicitly.
         _unitOfWork.PasswordResetTokens.Update(resetToken);
 
+        // Password changed: revoke every active refresh token so stolen
+        // sessions cannot survive a reset.
+        await RevokeActiveRefreshTokensAsync(user.Id, cancellationToken).ConfigureAwait(false);
+
         await _unitOfWork.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return Result.Success();
     }
@@ -301,5 +297,203 @@ public sealed class AuthService(
         }, cancellationToken).ConfigureAwait(false);
 
         return Result.Success();
+    }
+
+    /// <inheritdoc />
+    public async Task<Result<LoginResponseDto>> CreateAdminAsync(
+        CreateAdminRequestDto request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var validation = Validators.DtoValidator.Validate(request);
+        if (validation.IsFailure)
+        {
+            return Result.Failure<LoginResponseDto>([.. validation.Errors]);
+        }
+
+        var normalizedEmail = request.Email.Trim().ToLowerInvariant();
+
+        // Serializable transaction: concurrent bootstrap requests serialize on
+        // the Users table, so exactly one request can observe "no admin exists"
+        // and insert; every other request (or a retry) hits the conflict below.
+        return await _unitOfWork.ExecuteInTransactionAsync(async token =>
+        {
+            if (await _unitOfWork.Users.ExistsAsync(u => u.Role == UserRole.Admin, token).ConfigureAwait(false))
+            {
+                return Result.Failure<LoginResponseDto>(Error.Conflict(
+                    "An administrator account already exists. Admin bootstrap is no longer available."));
+            }
+
+            if (await _unitOfWork.Users.ExistsAsync(u => u.Email == normalizedEmail, token).ConfigureAwait(false))
+            {
+                return Result.Failure<LoginResponseDto>(
+                    Error.Conflict("An account with this email already exists."));
+            }
+
+            var user = new User
+            {
+                Id = Guid.NewGuid(),
+                FullName = request.Name.Trim(),
+                Email = normalizedEmail,
+                // Same PBKDF2 hashing used by registration/login.
+                PasswordHash = PasswordHasher.Hash(request.Password),
+                Role = UserRole.Admin,
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await _unitOfWork.Users.AddAsync(user, token).ConfigureAwait(false);
+            return Result.Success(await IssueTokenPairAsync(user, token).ConfigureAwait(false));
+        }, System.Data.IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<Result<LoginResponseDto>> RefreshTokenAsync(
+        RefreshTokenRequestDto request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var validation = Validators.DtoValidator.Validate(request);
+        if (validation.IsFailure)
+        {
+            return Result.Failure<LoginResponseDto>([.. validation.Errors]);
+        }
+
+        var tokenHash = SecureTokenGenerator.Hash(request.RefreshToken);
+
+        // Validation + rotation run inside one transaction so the same token
+        // presented twice concurrently can only be consumed a single time.
+        return await _unitOfWork.ExecuteInTransactionAsync(async token =>
+        {
+            var storedToken = await _unitOfWork.RefreshTokens.Query()
+                .FirstOrDefaultAsync(t => t.TokenHash == tokenHash, token)
+                .ConfigureAwait(false);
+
+            // One generic message for missing/expired/revoked/unknown-user
+            // cases — never reveal why a refresh token was rejected.
+            if (storedToken is null ||
+                storedToken.RevokedAtUtc is not null ||
+                storedToken.ExpiresAtUtc <= DateTime.UtcNow)
+            {
+                return Result.Failure<LoginResponseDto>(
+                    new Error(ErrorCodes.Unauthorized, "Invalid refresh token."));
+            }
+
+            var user = await _unitOfWork.Users.Query()
+                .FirstOrDefaultAsync(u => u.Id == storedToken.UserId, token)
+                .ConfigureAwait(false);
+
+            if (user is null || !user.IsActive)
+            {
+                return Result.Failure<LoginResponseDto>(
+                    new Error(ErrorCodes.Unauthorized, "Invalid refresh token."));
+            }
+
+            // Rotation: revoke the presented token, then issue a fresh pair.
+            // The token is fetched tracked so the change is persisted even if
+            // the same context instance already tracks this row.
+            var trackedToken = await _unitOfWork.RefreshTokens
+                .GetByIdTrackedAsync(storedToken.Id, token)
+                .ConfigureAwait(false);
+
+            trackedToken!.RevokedAtUtc = DateTime.UtcNow;
+
+            return Result.Success(await IssueTokenPairAsync(user, token).ConfigureAwait(false));
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<Result> RevokeRefreshTokenAsync(
+        string refreshToken,
+        Guid userId,
+        CancellationToken cancellationToken = default)
+    {
+        var tokenHash = SecureTokenGenerator.Hash(refreshToken);
+
+        var storedToken = await _unitOfWork.RefreshTokens.Query()
+            .FirstOrDefaultAsync(t => t.TokenHash == tokenHash, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (storedToken is not null &&
+            storedToken.UserId == userId &&
+            storedToken.RevokedAtUtc is null)
+        {
+            var trackedToken = await _unitOfWork.RefreshTokens
+                .GetByIdTrackedAsync(storedToken.Id, cancellationToken)
+                .ConfigureAwait(false);
+
+            trackedToken!.RevokedAtUtc = DateTime.UtcNow;
+            await _unitOfWork.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // Idempotent logout: unknown/foreign/already-revoked tokens still
+        // succeed so no information about token existence is revealed.
+        return Result.Success();
+    }
+
+    /// <summary>
+    /// Revokes every active refresh token belonging to a user.
+    /// </summary>
+    /// <param name="userId">Owner of the tokens.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    private async Task RevokeActiveRefreshTokensAsync(Guid userId, CancellationToken cancellationToken)
+    {
+        var activeIds = await _unitOfWork.RefreshTokens.Query()
+            .Where(t => t.UserId == userId && t.RevokedAtUtc == null)
+            .Select(t => t.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var revokedAt = DateTime.UtcNow;
+        foreach (var activeId in activeIds)
+        {
+            var activeToken = await _unitOfWork.RefreshTokens
+                .GetByIdTrackedAsync(activeId, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (activeToken is not null)
+            {
+                activeToken.RevokedAtUtc = revokedAt;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issues a fresh access-token/refresh-token pair for the user and
+    /// persists the refresh-token hash for later validation.
+    /// </summary>
+    /// <param name="user">The authenticated user.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns>The complete authentication response payload.</returns>
+    private async Task<LoginResponseDto> IssueTokenPairAsync(User user, CancellationToken cancellationToken)
+    {
+        var utcNow = DateTime.UtcNow;
+        var accessTokenExpiresAtUtc = utcNow.AddMinutes(_jwtSettings.ExpiryMinutes);
+        var refreshTokenExpiresAtUtc = utcNow.AddDays(_jwtSettings.RefreshTokenExpirationDays);
+        var rawRefreshToken = SecureTokenGenerator.Generate();
+
+        await _unitOfWork.RefreshTokens.AddAsync(new RefreshToken
+        {
+            Id = Guid.NewGuid(),
+            UserId = user.Id,
+            // Only the SHA-256 hash is stored, mirroring PasswordResetToken.
+            TokenHash = SecureTokenGenerator.Hash(rawRefreshToken),
+            ExpiresAtUtc = refreshTokenExpiresAtUtc,
+            CreatedAtUtc = utcNow
+        }, cancellationToken).ConfigureAwait(false);
+        await _unitOfWork.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        var accessToken = _jwtService.GenerateToken(user.Id, user.Email, user.Role);
+
+        return new LoginResponseDto(
+            accessToken,
+            accessTokenExpiresAtUtc,
+            rawRefreshToken,
+            refreshTokenExpiresAtUtc,
+            user.Id,
+            user.Email,
+            user.Role.ToString());
     }
 }

@@ -102,6 +102,70 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     /// <summary>
+    /// One-time bootstrap: creates the very first administrator account while
+    /// no admin exists in the database. Returns 409 afterwards — additional
+    /// admins are created through <c>POST /api/admin/users</c>.
+    /// </summary>
+    /// <param name="request">Admin account details.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns>201 with the issued token pair; 400/409 on invalid input or an existing admin.</returns>
+    [HttpPost("create-admin")]
+    [AllowAnonymous]
+    [ProducesResponseType(typeof(LoginResponseDto), StatusCodes.Status201Created)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> CreateAdmin([FromBody] CreateAdminRequestDto request, CancellationToken cancellationToken)
+    {
+        var result = await _authService.CreateAdminAsync(request, cancellationToken).ConfigureAwait(false);
+
+        return result.IsSuccess
+            ? Created(string.Empty, result.Value)
+            : result.ToProblemResult(HttpContext.TraceIdentifier);
+    }
+
+    /// <summary>
+    /// Exchanges a valid refresh token for a fresh access/refresh token pair.
+    /// The presented token is rotated (revoked) so it cannot be replayed.
+    /// </summary>
+    /// <param name="request">The refresh token to exchange.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns>200 with the new token pair; 401 for invalid/expired/revoked tokens.</returns>
+    [HttpPost("refresh-token")]
+    [AllowAnonymous]
+    [ProducesResponseType(typeof(LoginResponseDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status401Unauthorized)]
+    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequestDto request, CancellationToken cancellationToken)
+    {
+        var result = await _authService.RefreshTokenAsync(request, cancellationToken).ConfigureAwait(false);
+
+        return result.IsSuccess
+            ? Ok(result.Value)
+            : result.ToProblemResult(HttpContext.TraceIdentifier);
+    }
+
+    /// <summary>
+    /// Revokes the caller's refresh token (logout). Idempotent.
+    /// </summary>
+    /// <param name="request">The refresh token to revoke.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns>204 on success.</returns>
+    [HttpPost("revoke-refresh-token")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status401Unauthorized)]
+    public async Task<IActionResult> RevokeRefreshToken([FromBody] RefreshTokenRequestDto request, CancellationToken cancellationToken)
+    {
+        var result = await _authService.RevokeRefreshTokenAsync(request.RefreshToken, User.GetUserId(), cancellationToken)
+            .ConfigureAwait(false);
+
+        return result.IsSuccess
+            ? NoContent()
+            : result.ToProblemResult(HttpContext.TraceIdentifier);
+    }
+
+    /// <summary>
     /// Permanently deletes the authenticated account after verifying the
     /// current password. Removes the user's borrowing history and notifications.
     /// </summary>

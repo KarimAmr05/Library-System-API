@@ -25,6 +25,9 @@ public interface IUnitOfWork : IAsyncDisposable
     /// <summary>Gets the generic password-reset-token repository.</summary>
     IGenericRepository<PasswordResetToken> PasswordResetTokens { get; }
 
+    /// <summary>Gets the generic refresh-token repository.</summary>
+    IGenericRepository<RefreshToken> RefreshTokens { get; }
+
     /// <summary>
     /// Persists all staged changes in a single round trip.
     /// </summary>
@@ -49,4 +52,16 @@ public interface IUnitOfWork : IAsyncDisposable
     /// <param name="cancellationToken">Token to cancel the operation.</param>
     /// <returns>The operation's result once the transaction has committed.</returns>
     Task<T> ExecuteInTransactionAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Executes the supplied operation inside a database transaction with an
+    /// explicit isolation level (e.g. serializable checks that must observe a
+    /// consistent database state against concurrent writers).
+    /// </summary>
+    /// <typeparam name="T">Result type of the operation.</typeparam>
+    /// <param name="operation">The work to execute within the transaction.</param>
+    /// <param name="isolationLevel">Transaction isolation level to use.</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns>The operation's result once the transaction has committed.</returns>
+    Task<T> ExecuteInTransactionAsync<T>(Func<CancellationToken, Task<T>> operation, System.Data.IsolationLevel isolationLevel, CancellationToken cancellationToken = default);
 }

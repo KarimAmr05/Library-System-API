@@ -35,6 +35,11 @@ public class LibraryDBContext(DbContextOptions<LibraryDBContext> options) : DbCo
     /// Gets or sets the one-time password reset tokens.
     /// </summary>
     public DbSet<PasswordResetToken> PasswordResetTokens { get; set; }
+
+    /// <summary>
+    /// Gets or sets the refresh tokens used for session renewal.
+    /// </summary>
+    public DbSet<RefreshToken> RefreshTokens { get; set; }
     /// <summary>
     /// Configures the entity mappings using explicit <c>IEntityTypeConfiguration</c> classes.
     /// </summary>
